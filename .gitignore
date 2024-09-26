@@ -1,3 +1,6 @@
 .env
 .venv
 cdk.out
+.vscode
+cdk.context.json
+lib/__pycache__/
