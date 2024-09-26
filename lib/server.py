@@ -9,7 +9,9 @@ from aws_cdk import (
     Stack,
     Environment,
     Duration,
-    aws_elasticloadbalancingv2 as elbv2
+    aws_elasticloadbalancingv2 as elbv2,
+    aws_efs as efs,
+    RemovalPolicy
 )
 import os
 import dotenv
@@ -41,16 +43,69 @@ class Discocraftainer(Stack):
             ),
         )
         
-        # now we will define the ECS fargate service which will run both our
-        # minecraft server and the watchdog container
+        # create a file system for the minecraft server
+        self.file_system = efs.FileSystem(
+            self, "DiscocraftainerFileSystem",
+            vpc=self.platform.vpc,
+            removal_policy=RemovalPolicy.SNAPSHOT,
+            )
+        
+        # create an access point for the file system
+        self.access_point = self.file_system.add_access_point(
+            "DiscocraftainerAccessPoint",
+            path="/minecraft",
+            posix_user={
+                "uid": "1000",
+                "gid": "1000"
+            },
+            create_acl={
+                "owner_gid": "1000",
+                "owner_uid": "1000",
+                "permissions": "0755"
+            }
+        )
+        
+        # attach the efs read/write to the task role
+        self.task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="AllowReadWriteOnEFS",
+                actions=[
+                    "elasticfilesystem:ClientMount",
+                    "elasticfilesystem:ClientWrite",
+                    "elasticfilesystem:DescribeFileSystems",
+                ],
+                resources=[self.file_system.file_system_arn],
+                conditions={
+                    "StringEquals": {
+                        "elasticfilesystem:AccessPointArn": self.access_point.access_point_arn
+                    }
+                }
+            )
+        )
+        
+        # now we will define the ECS fargate task which will run both our
+        # minecraft server and the watchdog container using the task role
         self.task_definition = ecs.FargateTaskDefinition(
             self, "DiscocraftainerTaskDef",
             cpu=1024,
             memory_limit_mib=2048,
             task_role=self.task_role,
             execution_role=self.task_role,
+            # add the efs volume to the task definition
+            volumes=[
+                ecs.Volume(
+                    name="data",
+                    efs_volume_configuration=ecs.EfsVolumeConfiguration(
+                        file_system_id=self.file_system.file_system_id,
+                        transit_encryption='ENABLED',
+                        authorization_config=ecs.AuthorizationConfig(
+                            access_point_id=self.access_point.access_point_id,
+                            iam='ENABLED'
+                        )
+                    )
+                )
+            ]
         )
-         
         
         # add the minecraft container to the task definition
         self.minecraft_container = self.task_definition.add_container(
@@ -68,6 +123,15 @@ class Discocraftainer(Stack):
             ecs.PortMapping(container_port=server_port, protocol=ecs.Protocol.TCP)
         )
         
+        # add efs mount points to the minecraft container
+        self.minecraft_container.add_mount_points(
+            ecs.MountPoint(
+                container_path="/data",
+                source_volume="data",
+                read_only=False
+            )
+        )
+        
         # configure the subdomain
         self.hosted_zone = route53.HostedZone.from_lookup(
             self, "OuradioHostedZone",
@@ -81,10 +145,18 @@ class Discocraftainer(Stack):
             allow_all_outbound=True
         )
         
+        # allow the service receive traffic on the server port
         self.service_sg.add_ingress_rule(
             ec2.Peer.any_ipv4(),
             ec2.Port.tcp(server_port),
             "Allow TCP on port " + str(server_port)
+        )
+        
+        # add ingress rule for efs to task communication
+        self.file_system.connections.allow_from(
+            self.service_sg,
+            ec2.Port.tcp(2049),
+            "Allow EFS communication"
         )
         
         # now lets define the fargate service which will run our task definition
